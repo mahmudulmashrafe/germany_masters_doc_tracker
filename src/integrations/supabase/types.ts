@@ -16,28 +16,34 @@ export type Database = {
     Tables: {
       doc_batches: {
         Row: {
+          category: string
           coverage_end: string
           coverage_start: string
           created_at: string
           id: string
+          mail_date: string | null
           mail_month: string
           notes: string | null
           people_count: number
         }
         Insert: {
+          category?: string
           coverage_end: string
           coverage_start: string
           created_at?: string
           id?: string
+          mail_date?: string | null
           mail_month: string
           notes?: string | null
           people_count?: number
         }
         Update: {
+          category?: string
           coverage_end?: string
           coverage_start?: string
           created_at?: string
           id?: string
+          mail_date?: string | null
           mail_month?: string
           notes?: string | null
           people_count?: number

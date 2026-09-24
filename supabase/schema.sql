@@ -59,6 +59,8 @@ create trigger on_auth_user_created_admin
 -- 5. Create doc_batches table
 create table if not exists public.doc_batches (
   id uuid primary key default gen_random_uuid(),
+  category text not null default 'masters',
+  mail_date date,
   mail_month date not null,
   coverage_start date not null,
   coverage_end date not null,
@@ -66,6 +68,11 @@ create table if not exists public.doc_batches (
   notes text,
   created_at timestamptz not null default now()
 );
+
+-- Ensure category and mail_date columns exist if upgrading an existing table
+alter table public.doc_batches add column if not exists category text not null default 'masters';
+alter table public.doc_batches add column if not exists mail_date date;
+update public.doc_batches set mail_date = mail_month where mail_date is null;
 
 grant select on public.doc_batches to anon, authenticated;
 grant insert, update, delete on public.doc_batches to authenticated;
