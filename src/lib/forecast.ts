@@ -92,7 +92,21 @@ function linearFit(values: number[]) {
   return { a: my - b * mx, b };
 }
 
-export function forecast(batches: Batch[], months = 8): Prediction[] {
+export type ForecastMode = "till_april" | "all_to_cap";
+
+export function getMonthsUntilNextApril(fromDate: Date): number {
+  const currentMonth = fromDate.getUTCMonth(); // 0 = Jan, 3 = Apr, 8 = Sep, 11 = Dec
+  // If current month is before April (Jan, Feb, Mar):
+  // next April is in the current calendar year (e.g. Jan -> 3 months: Feb, Mar, Apr)
+  if (currentMonth < 3) {
+    return 3 - currentMonth;
+  }
+  // If current month is April or later (Apr..Dec):
+  // next April is in the following calendar year (e.g. Sep -> 7 months: Oct, Nov, Dec, Jan, Feb, Mar, Apr)
+  return 12 - currentMonth + 3;
+}
+
+export function forecast(batches: Batch[], mode: ForecastMode = "till_april"): Prediction[] {
   if (batches.length < 2) return [];
 
   // Sort chronologically by the actual mail date
@@ -118,23 +132,20 @@ export function forecast(batches: Batch[], months = 8): Prediction[] {
     ),
   );
 
-  // Intervals (in days) between consecutive mail delivery dates
-  const mailIntervals: number[] = [];
-  for (let i = 1; i < sorted.length; i++) {
-    const gap = daysBetween(getBatchMailDate(sorted[i - 1]!), getBatchMailDate(sorted[i]!));
-    if (gap > 0) mailIntervals.push(gap);
-  }
-  const avgMailInterval = Math.max(
-    14,
-    Math.round(mailIntervals.length ? weightedAvg(mailIntervals.slice(-4)) : 30),
-  );
-
   const last = sorted[sorted.length - 1]!;
   let prevEnd = toDate(last.coverage_end);
   const lastMailDate = getBatchMailDate(last);
+  const lastMailMonth = toDate(last.mail_month);
+  const lastMailDay = lastMailDate.getUTCDate();
+
+  const maxRounds =
+    mode === "till_april"
+      ? getMonthsUntilNextApril(lastMailMonth)
+      : 48;
+
   const out: Prediction[] = [];
 
-  for (let i = 1; i <= months; i++) {
+  for (let i = 1; i <= maxRounds; i++) {
     // If previous round already covered up to April 2026 cap, stop
     if (prevEnd.getTime() >= MAX_COVERAGE_DATE.getTime()) {
       break;
@@ -153,8 +164,14 @@ export function forecast(batches: Batch[], months = 8): Prediction[] {
     }
 
     const daysCovered = Math.max(1, daysBetween(start, end) + 1);
-    const predictedMailDate = addDays(lastMailDate, avgMailInterval * i);
-    const mailMonth = new Date(Date.UTC(predictedMailDate.getUTCFullYear(), predictedMailDate.getUTCMonth(), 1));
+
+    // Consecutive monthly cadence: every month must come
+    const mailMonth = addMonths(lastMailMonth, i);
+    const targetYear = mailMonth.getUTCFullYear();
+    const targetM = mailMonth.getUTCMonth();
+    const daysInMonth = new Date(Date.UTC(targetYear, targetM + 1, 0)).getUTCDate();
+    const day = Math.min(lastMailDay, daysInMonth);
+    const predictedMailDate = new Date(Date.UTC(targetYear, targetM, day));
 
     out.push({
       predictedMailDate,
@@ -239,3 +256,222 @@ export const fmtMonth = (d: Date) =>
 
 export const fmtDate = (d: Date) =>
   d.toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric", timeZone: "UTC" });
+
+export function getCategoryMetrics(batches: Batch[]) {
+  if (!batches.length) {
+    return {
+      totalPeople: 0,
+      avgIntervalDays: null,
+      avgAdvanceDays: null,
+      latestBatch: null,
+    };
+  }
+
+  const sorted = [...batches].sort(
+    (a, b) => getBatchMailDate(a).getTime() - getBatchMailDate(b).getTime(),
+  );
+  const totalPeople = sorted.reduce((s, b) => s + (b.people_count || 0), 0);
+  const latestBatch = sorted[sorted.length - 1]!;
+
+  const intervals: number[] = [];
+  for (let i = 1; i < sorted.length; i++) {
+    const gap = daysBetween(getBatchMailDate(sorted[i - 1]!), getBatchMailDate(sorted[i]!));
+    if (gap > 0) intervals.push(gap);
+  }
+  const avgIntervalDays = intervals.length
+    ? Math.round(intervals.reduce((a, b) => a + b, 0) / intervals.length)
+    : null;
+
+  const advances: number[] = [];
+  for (let i = 1; i < sorted.length; i++) {
+    const adv = daysBetween(toDate(sorted[i - 1]!.coverage_end), toDate(sorted[i]!.coverage_end));
+    if (adv > 0) advances.push(adv);
+  }
+  const avgAdvanceDays = advances.length
+    ? Math.round(advances.reduce((a, b) => a + b, 0) / advances.length)
+    : null;
+
+  return {
+    totalPeople,
+    avgIntervalDays,
+    avgAdvanceDays,
+    latestBatch,
+  };
+}
+
+export type UserPredictionResult =
+  | {
+      status: "already_covered";
+      batchName: string;
+      mailDate: Date;
+      coverageStart: Date;
+      coverageEnd: Date;
+    }
+  | {
+      status: "already_covered_prior";
+      earliestRecorded: Date;
+    }
+  | {
+      status: "projected";
+      predictedMailDate: Date;
+      coverageStart: Date;
+      coverageEnd: Date;
+      roundNumber: number;
+      daysRemaining: number;
+      submissionDaysAhead: number;
+      latestCoveredDate: Date;
+    }
+  | {
+      status: "beyond_cap";
+      maxDate: string;
+    }
+  | {
+      status: "insufficient_data";
+      message: string;
+    }
+  | {
+      status: "no_data";
+      message: string;
+    };
+
+export function predictUserDocMail(
+  batches: Batch[],
+  appointmentDateStr: string,
+): UserPredictionResult | null {
+  if (!appointmentDateStr) return null;
+  const appDate = toDate(appointmentDateStr);
+  if (isNaN(appDate.getTime())) return null;
+
+  if (!batches.length) {
+    return { status: "no_data", message: "No document rounds recorded yet for this category." };
+  }
+
+  // Check if date is after April 30, 2026 cap
+  if (appointmentDateStr > MAX_COVERAGE_DATE_STR) {
+    return { status: "beyond_cap", maxDate: MAX_COVERAGE_DATE_STR };
+  }
+
+  const sorted = [...batches].sort(
+    (a, b) => toDate(a.coverage_start).getTime() - toDate(b.coverage_start).getTime(),
+  );
+
+  // Check if already covered by an existing batch
+  for (const b of sorted) {
+    const start = toDate(b.coverage_start);
+    const end = toDate(b.coverage_end);
+    if (appDate.getTime() >= start.getTime() && appDate.getTime() <= end.getTime()) {
+      return {
+        status: "already_covered",
+        batchName: b.notes || fmtMonth(toDate(b.mail_month)),
+        mailDate: getBatchMailDate(b),
+        coverageStart: start,
+        coverageEnd: end,
+      };
+    }
+  }
+
+  const earliestStart = toDate(sorted[0]!.coverage_start);
+  if (appDate.getTime() < earliestStart.getTime()) {
+    return {
+      status: "already_covered_prior",
+      earliestRecorded: earliestStart,
+    };
+  }
+
+  // Not yet covered - check if we have enough batches to project
+  if (batches.length < 2) {
+    return {
+      status: "insufficient_data",
+      message: "At least 2 rounds are needed to compute turnaround pace and estimate your mail date.",
+    };
+  }
+
+  // Sort chronologically by mail date for forecasting
+  const sortedByMail = [...batches].sort(
+    (x, y) => getBatchMailDate(x).getTime() - getBatchMailDate(y).getTime(),
+  );
+
+  // How many days of submissions each mail round moves forward
+  const advances: number[] = [];
+  for (let i = 1; i < sortedByMail.length; i++) {
+    const d = daysBetween(toDate(sortedByMail[i - 1]!.coverage_end), toDate(sortedByMail[i]!.coverage_end));
+    if (d > 0) advances.push(d);
+  }
+  const advance = Math.max(
+    1,
+    Math.round(
+      advances.length
+        ? weightedAvg(advances.slice(-4))
+        : daysBetween(toDate(sortedByMail[0]!.coverage_start), toDate(sortedByMail[0]!.coverage_end)) + 1,
+    ),
+  );
+
+  // Intervals (in days) between consecutive mail delivery dates
+  const mailIntervals: number[] = [];
+  for (let i = 1; i < sortedByMail.length; i++) {
+    const gap = daysBetween(getBatchMailDate(sortedByMail[i - 1]!), getBatchMailDate(sortedByMail[i]!));
+    if (gap > 0) mailIntervals.push(gap);
+  }
+  const avgMailInterval = Math.max(
+    14,
+    Math.round(mailIntervals.length ? weightedAvg(mailIntervals.slice(-4)) : 30),
+  );
+
+  // Find latest coverage end across all batches
+  const sortedByEnd = [...batches].sort(
+    (a, b) => toDate(b.coverage_end).getTime() - toDate(a.coverage_end).getTime(),
+  );
+  const latestCoverageEnd = toDate(sortedByEnd[0]!.coverage_end);
+  const lastMailBatch = sortedByMail[sortedByMail.length - 1]!;
+  const lastMailDate = getBatchMailDate(lastMailBatch);
+  const lastMailMonth = toDate(lastMailBatch.mail_month);
+  const lastMailDay = lastMailDate.getUTCDate();
+
+  const submissionDaysAhead = Math.max(0, daysBetween(latestCoverageEnd, appDate));
+
+  // Run forward projection steps (up to 48 rounds or until covered / cap reached)
+  let prevEnd = latestCoverageEnd;
+  for (let round = 1; round <= 48; round++) {
+    const start = addDays(prevEnd, 1);
+    let end = addDays(prevEnd, advance);
+    if (end.getTime() >= MAX_COVERAGE_DATE.getTime()) {
+      end = MAX_COVERAGE_DATE;
+    }
+
+    // Monthly cadence: every month comes sequentially
+    const mailMonth = addMonths(lastMailMonth, round);
+    const targetYear = mailMonth.getUTCFullYear();
+    const targetM = mailMonth.getUTCMonth();
+    const daysInMonth = new Date(Date.UTC(targetYear, targetM + 1, 0)).getUTCDate();
+    const day = Math.min(lastMailDay, daysInMonth);
+    const predictedMailDate = new Date(Date.UTC(targetYear, targetM, day));
+
+    const now = new Date();
+    const daysRemaining = Math.max(0, daysBetween(now, predictedMailDate));
+
+    if (appDate.getTime() >= start.getTime() && appDate.getTime() <= end.getTime()) {
+      return {
+        status: "projected",
+        predictedMailDate,
+        coverageStart: start,
+        coverageEnd: end,
+        roundNumber: round,
+        daysRemaining,
+        submissionDaysAhead,
+        latestCoveredDate: latestCoverageEnd,
+      };
+    }
+
+    if (end.getTime() >= MAX_COVERAGE_DATE.getTime()) {
+      break;
+    }
+    prevEnd = end;
+  }
+
+  // If still not matched, cap calculation
+  return {
+    status: "beyond_cap",
+    maxDate: MAX_COVERAGE_DATE_STR,
+  };
+}
+

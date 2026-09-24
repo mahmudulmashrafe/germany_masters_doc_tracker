@@ -34,18 +34,11 @@ function createSupabaseFetch(supabaseKey: string): typeof fetch {
 export const requireSupabaseAuth = createMiddleware({ type: 'function' }).server(
   async ({ next }) => {
     
-    const SUPABASE_URL = process.env['SUPABASE_URL'];
-    const SUPABASE_PUBLISHABLE_KEY = process.env['SUPABASE_PUBLISHABLE_KEY'];
+    const DEFAULT_SUPABASE_URL = "https://hqsumtwagvlnruwtrlyt.supabase.co";
+    const DEFAULT_SUPABASE_KEY = "sb_publishable_-P-6-kwhN3WytBumWj_Ifw_oG67Hfeh";
 
-    if (!SUPABASE_URL || !SUPABASE_PUBLISHABLE_KEY) {
-      const missing = [
-        ...(!SUPABASE_URL ? ['SUPABASE_URL'] : []),
-        ...(!SUPABASE_PUBLISHABLE_KEY ? ['SUPABASE_PUBLISHABLE_KEY'] : []),
-      ];
-      const message = `Missing Supabase environment variable(s): ${missing.join(', ')}. Configure Supabase environment variables in .env or your hosting provider.`;
-      console.error(`[Supabase] ${message}`);
-      throw new Error(message);
-    }
+    const SUPABASE_URL = process.env['SUPABASE_URL'] || process.env['NEXT_PUBLIC_SUPABASE_URL'] || DEFAULT_SUPABASE_URL;
+    const SUPABASE_PUBLISHABLE_KEY = process.env['SUPABASE_PUBLISHABLE_KEY'] || process.env['NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY'] || DEFAULT_SUPABASE_KEY;
     
     const request = getRequest();
 
